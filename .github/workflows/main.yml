@@ -1,0 +1,140 @@
+name: Migrate annual Release BIN files to Hugging Face
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: "GitHub source repository (owner/repo)"
+        required: true
+        default: "forexdata/XAUUSD"
+      release_tag:
+        description: "Release tag, or latest"
+        required: true
+        default: "latest"
+      asset_pattern:
+        description: "ZIP asset glob, e.g. XAUUSD_*.zip"
+        required: true
+        default: "XAUUSD_*.zip"
+      symbol:
+        description: "Technical symbol, e.g. XAUUSD"
+        required: true
+        default: "XAUUSD"
+      digits:
+        description: "Digits written to index.txt"
+        required: true
+        default: "5"
+
+permissions:
+  contents: read
+
+env:
+  HF_DATASET: ${{ vars.HF_DATASET || 'Esmaeil9ss/Tickdata' }}
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout migration project
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependency
+        run: pip install "huggingface_hub>=0.24"
+
+      - name: Download ZIP assets from GitHub Release
+        shell: bash
+        env:
+          # For a private repository, create SOURCE_GH_TOKEN with read access.
+          # For public repositories, GITHUB_TOKEN is normally sufficient.
+          GH_TOKEN: ${{ secrets.SOURCE_GH_TOKEN || github.token }}
+          SOURCE_REPO: ${{ inputs.source_repo }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          ASSET_PATTERN: ${{ inputs.asset_pattern }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          if [[ "$RELEASE_TAG" == "latest" ]]; then
+            gh release download \
+              --repo "$SOURCE_REPO" \
+              --pattern "$ASSET_PATTERN" \
+              --dir release-assets \
+              --clobber
+          else
+            gh release download "$RELEASE_TAG" \
+              --repo "$SOURCE_REPO" \
+              --pattern "$ASSET_PATTERN" \
+              --dir release-assets \
+              --clobber
+          fi
+          find release-assets -maxdepth 1 -type f -name '*.zip' -print
+          test -n "$(find release-assets -maxdepth 1 -type f -name '*.zip' -print -quit)" \
+            || { echo "No matching ZIP release assets found" >&2; exit 1; }
+
+      - name: Convert each annual ZIP and upload its daily files
+        shell: bash
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          SYMBOL: ${{ inputs.symbol }}
+          DIGITS: ${{ inputs.digits }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          for zip_path in release-assets/*.zip; do
+            echo "============================================================"
+            echo "Processing: $zip_path"
+            rm -rf extracted daily-output
+            mkdir -p extracted daily-output
+
+            # Python's zipfile rejects neither absolute paths nor ../ by default,
+            # so validate members before extraction.
+            python - "$zip_path" extracted <<'PY'
+          import sys, zipfile
+          from pathlib import Path, PurePosixPath
+
+          archive = Path(sys.argv[1])
+          destination = Path(sys.argv[2]).resolve()
+          with zipfile.ZipFile(archive) as zf:
+              for info in zf.infolist():
+                  member = PurePosixPath(info.filename)
+                  if member.is_absolute() or ".." in member.parts:
+                      raise SystemExit(f"unsafe ZIP member: {info.filename}")
+              zf.extractall(destination)
+          PY
+
+            mapfile -d '' bins < <(find extracted -type f -iname '*.bin' -print0)
+            if [[ ${#bins[@]} -ne 1 ]]; then
+              echo "Expected exactly one annual BIN in $zip_path; found ${#bins[@]}" >&2
+              printf '  %s\n' "${bins[@]:-}"
+              exit 1
+            fi
+
+            python tools/split_yearly_bin.py \
+              "${bins[0]}" \
+              --symbol "$SYMBOL" \
+              --output daily-output
+
+            python tools/upload_daily_hf.py \
+              daily-output \
+              --repo-id "$HF_DATASET" \
+              --symbol "$SYMBOL" \
+              --digits "$DIGITS"
+
+            # Free runner disk before processing the next year.
+            rm -rf extracted daily-output
+          done
+
+      - name: Upload migration logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: migration-debug-${{ inputs.symbol }}
+          path: |
+            release-assets/
+          retention-days: 3
+          if-no-files-found: ignore
